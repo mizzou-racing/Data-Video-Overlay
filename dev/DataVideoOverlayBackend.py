@@ -1,13 +1,36 @@
 import numpy as np
 import pandas as pd
-import os
-os.environ["FFMPEG_BINARY"] = "ffmpeg/ffmpeg.exe"
-os.environ["FFPLAY_BINARY"] = "ffmpeg/ffplay.exe"
+import os, sys
+
+# Only point moviepy at a local ffmpeg if one is actually there, otherwise it uses its bundled ffmpeg
+if os.path.exists("ffmpeg/ffmpeg.exe"):
+    os.environ["FFMPEG_BINARY"] = "ffmpeg/ffmpeg.exe"
+if os.path.exists("ffmpeg/ffplay.exe"):
+    os.environ["FFPLAY_BINARY"] = "ffmpeg/ffplay.exe"
+
 from moviepy import *
 from PIL import Image, ImageDraw
 
 
 # https://youtu.be/8uGWXPqD8OA?si=ALAgcGJCDbM_9pUZ
+
+
+def imgPath(name):
+    # Images live next to this file normally, and in sys._MEIPASS when running in a PyInstaller bundle
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, "images", name)
+    else:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", name)
+
+
+# Columns the overlays need from the CSV
+requiredColumns = ["Time",
+                   "MPH",
+                   "RPM",
+                   "throttle pos",
+                   "Gear",
+                   "VN Accel Lat",
+                   "VN Accel Long"]
 
 
 def loadCSV(path):
@@ -27,26 +50,30 @@ def loadCSV(path):
     df["VN Accel Long"] = df["VN Accel Long"].astype(float)
 
     # Keep only the columns we need
-    return df[["Time", 
-               "MPH", 
-               "RPM", 
-               "throttle pos", 
-               "Gear",
-               "VN Accel Lat",
-               "VN Accel Long"]].reset_index(drop=True)
+    return df[requiredColumns].reset_index(drop=True)
 
 
-def dataAtTime(dataframe, t):
-    times = dataframe["Time"].values
-    speeds = dataframe["MPH"].values
-    revs = dataframe["RPM"].values
-    throttlepos = dataframe["throttle pos"].values
-    gear = dataframe["Gear"].values
-    accelLat = dataframe["VN Accel Lat"].values
-    accelLong = dataframe["VN Accel Long"].values
+def stepLookup(t, times, vals):
+    # Holds the last logged value instead of interpolating (so gear never reads 2.4 mid-shift)
+    return vals[np.clip(np.searchsorted(times, t, side="right") - 1, 0, len(vals) - 1)]
+
+
+def columnArrays(dataframe):
+    # Pull the columns out as numpy arrays once so dataAtTime doesn't redo it every frame
+    return {column: dataframe[column].values for column in dataframe.columns}
+
+
+def dataAtTime(columns, t):
+    times = columns["Time"]
+    speeds = columns["MPH"]
+    revs = columns["RPM"]
+    throttlepos = columns["throttle pos"]
+    gear = columns["Gear"]
+    accelLat = columns["VN Accel Lat"]
+    accelLong = columns["VN Accel Long"]
 
     # 0 = MPH, 1 = RPM, 2 = Throttle Position, 3 = Gear
-    return float(np.interp(t, times, speeds)), float(np.interp(t, times, revs)), float(np.interp(t, times, throttlepos)), float(np.interp(t, times, gear)), float(np.interp(t, times, accelLat)), float(np.interp(t, times, accelLong))
+    return float(np.interp(t, times, speeds)), float(np.interp(t, times, revs)), float(np.interp(t, times, throttlepos)), float(stepLookup(t, times, gear)), float(np.interp(t, times, accelLat)), float(np.interp(t, times, accelLong))
 
 
 def roundedMask(size, radius):
@@ -64,19 +91,21 @@ def roundedMask(size, radius):
     return np.array(img) / 255.0
 
 
-def makeThrottleBar(df, videoDuration, width=300, height=20, color=(0, 255, 0)):
+def makeThrottleBar(df, videoDuration, width=300, height=20, color=(0, 255, 0), throttleMax=1000):
+    # throttleMax is the logger's full-throttle reading
 
     times = df["Time"].values
     throttle_values = df["throttle pos"].values
 
     def make_frame(t):
-        throttle = float(np.interp(t, times, throttle_values)) / 10
+        throttle = float(np.interp(t, times, throttle_values)) / throttleMax * 100
+        throttle = min(max(throttle, 0), 100)
 
         bar_width = int((throttle / 100) * width)
-        
+
         # Create a blank frame
         frame = np.zeros((height, width, 3), dtype=np.uint8)
-        
+
         # Fill in the bar
         frame[:, :bar_width] = color
         return frame
@@ -86,13 +115,70 @@ def makeThrottleBar(df, videoDuration, width=300, height=20, color=(0, 255, 0)):
     return clip
 
 
-def makeClip(df, videoDuration, windowSize, fontSizeDivisionFactor, index, needsNeedle=False, imageLocation=None, label=None, conversionRate=1.5, baseValue=300, bgColor=None, horizontalAlign="center", verticalAlign="center", textAlign="left", cornerRoundness=None):
-    
+def makeGGMeter(df, duration, size=200, maxG=1.5, units_in_ms2=True, flipLat=False, flipLong=False, dotDiameter=20):
+    times = df["Time"].values
+    scale = 9.81 if units_in_ms2 else 1.0
+    lat = df["VN Accel Lat"].values / scale * (-1 if flipLat else 1)
+    lon = df["VN Accel Long"].values / scale * (-1 if flipLong else 1)
+    ringRadius = 48 / 100 * size
+    # The dot is centered on its canvas and is 26 px wide on the 100 px image, so size the canvas
+    # to make the visible dot dotDiameter pixels wide
+    dotSize = max(1, int(round(dotDiameter * 100 / 26)))
+    ring = ImageClip(imgPath("gg.png")).resized((size, size)).with_duration(duration)
+    dot = ImageClip(imgPath("ggDot.png")).resized((dotSize, dotSize)).with_duration(duration)
+    def dotPos(t):
+        gx = float(np.interp(t, times, lat)) / maxG
+        gy = float(np.interp(t, times, lon)) / maxG
+        mag = np.hypot(gx, gy)
+        if mag > 1:
+            gx, gy = gx / mag, gy / mag
+        corner = (size - dotSize) / 2
+        return (corner + gx * ringRadius, corner - gy * ringRadius)  # accel up, braking down
+    dot = dot.with_position(dotPos)
+
+    # Lat (X) and Long (Y) readout to the right of the rings, in G's rounded to the nearest tenth
+    renderedText = {}
+
+    def readoutFrame(t, mask=False):
+        # + 0.0 turns -0.0 into 0.0
+        x = round(float(np.interp(t, times, lat)), 1) + 0.0
+        y = round(float(np.interp(t, times, lon)), 1) + 0.0
+        txt = f"X: {x:.1f}\nY: {y:.1f}"
+
+        if txt not in renderedText:
+            text = TextClip(text=txt,
+                            font_size=(size/6),
+                            color="white",
+                            method="caption",
+                            size=(size,size),
+                            transparent=True,
+                            horizontal_align="left",
+                            vertical_align="center",
+                            text_align="left")
+
+            renderedText[txt] = (text.get_frame(0), text.mask.get_frame(0))
+
+        return renderedText[txt][1] if mask else renderedText[txt][0]
+
+    readout = VideoClip(lambda t: readoutFrame(t), duration=duration)
+    readout.mask = VideoClip(lambda t: readoutFrame(t, mask=True), duration=duration, is_mask=True)
+    readout = readout.with_position((int(size * 1.08), 0))
+
+    return CompositeVideoClip([ring, dot, readout], size=(size * 2, size)).with_duration(duration).with_opacity(.58)
+
+
+def makeClip(df, videoDuration, windowSize, fontSizeDivisionFactor, index, needsNeedle=False, imageLocation=None, label=None, conversionRate=1.5, baseValue=300, bgColor=None, horizontalAlign="center", verticalAlign="center", textAlign="left", cornerRoundness=None, textPosition=None):
+
+    columns = columnArrays(df)
+
+    # The displayed number changes far less often than the frame rate, so each string is only rendered once
+    renderedText = {}
+
     def makeTextFrame(t, index, bgColor, horizontalAlign, verticalAlign, textAlign, mask=False):
-        data = dataAtTime(df, t)
+        data = dataAtTime(columns, t)
 
         if label != None:
-            
+
             match index:
 
                 case 3:
@@ -106,24 +192,39 @@ def makeClip(df, videoDuration, windowSize, fontSizeDivisionFactor, index, needs
             txt = f"{int(data[index])}"
 
 
-        text = TextClip(text=txt, 
-                        font_size=(windowSize/fontSizeDivisionFactor), 
-                        color="white",
-                        method="caption", 
-                        size=(windowSize,windowSize),
-                        transparent=True,
-                        bg_color=bgColor,
-                        horizontal_align=horizontalAlign,
-                        vertical_align=verticalAlign,
-                        text_align=textAlign)
-        
+        if txt not in renderedText:
+            text = TextClip(text=txt,
+                            font_size=(windowSize/fontSizeDivisionFactor),
+                            color="white",
+                            method="caption",
+                            size=(windowSize,windowSize),
+                            transparent=True,
+                            bg_color=bgColor,
+                            horizontal_align=horizontalAlign,
+                            vertical_align=verticalAlign,
+                            text_align=textAlign)
 
-        return text.mask.get_frame(t) if mask else text.get_frame(t)
-    
-    
+            renderedText[txt] = (text.get_frame(0), text.mask.get_frame(0))
+
+
+        return renderedText[txt][1] if mask else renderedText[txt][0]
+
+
+    # Loaded once, only rotated per frame
+    needle = ImageClip(imgPath("needle.png"), False, True)
+    needle = needle.with_duration(videoDuration)
+
+    # moviepy asks for the same needle frame several times per output frame (resize, opacity and mask
+    # compositing each pull it), so keep the rotated image and mask for the current t
+    rotatedFrames = {}
+
     def makeNeedle(t, index, conversionRate, baseValue, mask=False):
-        needle = ImageClip("./dev/images/needle.png", False, True)
-        needle = needle.with_duration(videoDuration)
+        if rotatedFrames.get("t") != t:
+            rotatedFrames.clear()
+            rotatedFrames["t"] = t
+
+        if mask in rotatedFrames:
+            return rotatedFrames[mask]
 
 
         # Zero MPH is the needle rotated 300 degrees
@@ -139,13 +240,15 @@ def makeClip(df, videoDuration, windowSize, fontSizeDivisionFactor, index, needs
         #ZEROMPH = 300
 
         #conversionRate = 1.5
-        mph = dataAtTime(df, t)
+        mph = dataAtTime(columns, t)
 
-        needle = needle.rotated(baseValue - (mph[index] * conversionRate))
+        rotatedNeedle = needle.rotated(baseValue - (mph[index] * conversionRate))
 
-        return needle.mask.get_frame(t) if mask else needle.get_frame(t)
+        rotatedFrames[mask] = rotatedNeedle.mask.get_frame(t) if mask else rotatedNeedle.get_frame(t)
 
-    
+        return rotatedFrames[mask]
+
+
     itemsToCompose = []
 
 
@@ -162,7 +265,7 @@ def makeClip(df, videoDuration, windowSize, fontSizeDivisionFactor, index, needs
     mphTextMask = VideoClip(lambda t: makeTextFrame(t, index, bgColor, horizontalAlign, verticalAlign, textAlign, mask=True), duration=videoDuration, is_mask=True)
 
     if cornerRoundness != None:
-        
+
         rounded = roundedMask((windowSize, windowSize), cornerRoundness)
 
         roundedClip = ImageClip(
@@ -175,7 +278,11 @@ def makeClip(df, videoDuration, windowSize, fontSizeDivisionFactor, index, needs
     else:
         mphText.mask = mphTextMask
 
-    mphText = mphText.with_position((0,105))
+    # Default puts the readout in the lower part of the gauge, scaled to the window size
+    if textPosition == None:
+        textPosition = (0, int(windowSize * 0.21))
+
+    mphText = mphText.with_position(textPosition)
 
     itemsToCompose.append(mphText)
 
@@ -188,12 +295,124 @@ def makeClip(df, videoDuration, windowSize, fontSizeDivisionFactor, index, needs
         itemsToCompose.append(mphNeedle)
 
 
-    dynamicCompo = CompositeVideoClip(itemsToCompose)
+    dynamicCompo = CompositeVideoClip(itemsToCompose, size=(windowSize, windowSize))
 
     dynamicCompo = dynamicCompo.with_opacity(.58)
 
     return dynamicCompo
 
+
+def isAspectRatio(ar, target):
+    return abs(ar - target) < 0.01
+
+
+def buildComposite(csvPath, videoPath):
+    # Builds the video with every overlay on it. Split out of backendMain so it can be tested without previewing
+    loadedCSV = loadCSV(csvPath)
+
+    video = VideoFileClip(videoPath)
+
+    videoLength = video.duration
+
+    video = video.with_duration(videoLength)
+
+    windowSize = 500
+    fontSizeDivisionFactor = 11.6
+
+                                                                             # 0 = MPH
+    mph = makeClip(loadedCSV, videoLength, windowSize, fontSizeDivisionFactor, 0, True, imgPath("speedometer.png"))
+
+                                                                             # 1 = RPM
+    rpm = makeClip(loadedCSV, videoLength, windowSize, fontSizeDivisionFactor, 1, True, imgPath("tachometer.png"), conversionRate=3.977, baseValue=315)
+
+
+    throttleBar = makeThrottleBar(loadedCSV, video.duration, width=650, height=20, color=(255,0,0))
+                                                                                        # Mizzou Gold: rgb(241, 184, 45)
+
+
+                                                  # 3 = gear
+    gear = makeClip(loadedCSV, videoLength, 250, 4, 3, label="Gear", bgColor="black", verticalAlign="top", textAlign="center", cornerRoundness=25, textPosition=(0,0))
+
+    # The log records acceleration in G's, not m/s^2
+    gg = makeGGMeter(loadedCSV, videoLength, size=200, units_in_ms2=False)
+
+
+    ar = video.aspect_ratio
+
+    if isAspectRatio(ar, 16/9):
+        print("widescreen landscape")
+        mph = mph.resized((370,370))
+        mph = mph.with_position((0,0))
+
+        rpm = rpm.resized((370,370))
+        rpm = rpm.with_position((350,0))
+
+        gear = gear.resized((150,150))
+        gear = gear.with_position((300,200))
+
+        throttleBar = throttleBar.with_position((35,380))
+
+        gg = gg.with_position((740,85))
+
+
+    elif isAspectRatio(ar, 9/16):
+        print("widescreen portrait")
+        mph = mph.resized((350,350))
+        mph = mph.with_position((0,0))
+
+        rpm = rpm.resized((350,350))
+        rpm = rpm.with_position((350,0))
+
+        gear = gear.resized((150,150))
+        gear = gear.with_position((100,600))
+
+        throttleBar = throttleBar.with_position((25,360))
+
+        gg = gg.with_position((300,600))
+
+    elif isAspectRatio(ar, 4/3):
+        print("Fullscreen\nWhy are you using 4:3 in the 2020s")
+        mph = mph.resized((370,370))
+        mph = mph.with_position((0,0))
+
+        rpm = rpm.resized((370,370))
+        rpm = rpm.with_position((350,0))
+
+        gear = gear.resized((150,150))
+        gear = gear.with_position((300,200))
+
+        throttleBar = throttleBar.with_position((35,380))
+
+        gg = gg.with_position((740,85))
+
+    else:
+        print(f"Unrecognized aspect ratio {ar:.3f}, using the default layout")
+        mph = mph.resized((370,370))
+        mph = mph.with_position((0,0))
+
+        rpm = rpm.resized((370,370))
+        rpm = rpm.with_position((350,0))
+
+        gear = gear.resized((150,150))
+        gear = gear.with_position((300,200))
+
+        throttleBar = throttleBar.with_position((35,380))
+
+        gg = gg.with_position((740,85))
+
+
+    finalCompo = CompositeVideoClip(
+        [
+            video,
+            mph,
+            rpm,
+            throttleBar,
+            gear,
+            gg
+        ]
+    )
+
+    return finalCompo
 
 
 def backendMain(csvPath, videoPath):
@@ -204,81 +423,23 @@ def backendMain(csvPath, videoPath):
     if csvPath.strip() != "" and videoPath.strip() != "":
         print(csvPath, videoPath)
 
-        loadedCSV = loadCSV(csvPath)
+        finalCompo = buildComposite(csvPath, videoPath)
 
-        video = VideoFileClip(videoPath)
-
-        videoLength = video.duration
-
-        video = video.with_duration(videoLength)
-
-        windowSize = 500
-        fontSizeDivisionFactor = 11.6
-
-                                                                                 # 0 = MPH
-        mph = makeClip(loadedCSV, videoLength, windowSize, fontSizeDivisionFactor, 0, True, "./dev/images/speedometer.png")
-
-                                                                                 # 1 = RPM
-        rpm = makeClip(loadedCSV, videoLength, windowSize, fontSizeDivisionFactor, 1, True, "./dev/images/tachometer.png", conversionRate=3.977, baseValue=315)
-
-
-        throttleBar = makeThrottleBar(loadedCSV, video.duration, width=300, height=20, color=(255,0,0))
-                                                                                            # Mizzou Gold: rgb(241, 184, 45)
-
-
-                                                      # 3 = gear
-        gear = makeClip(loadedCSV, videoLength, 250, 4, 3, label="Gear", bgColor="black", verticalAlign="top", textAlign="center", cornerRoundness=25)
-        
-
-
-
-        if video.aspect_ratio == 16/9:
-            print("widescreen landscape")
-            mph = mph.resized((370,370))
-            rpm = rpm.resized((370,370))
-            rpm = rpm.with_position((350,0))
-
-            gear = gear.resized((150,150))
-            gear = gear.with_position((300,200))
-            
-
-        elif video.aspect_ratio == 9/16:
-            print("widescreen portrait")
-            mph = mph.resized((350,350))
-        
-            rpm = rpm.resized((350,350))
-
-            rpm = rpm.with_position((350,0))
-
-            gear = gear.with_position((100,600))
-
-        elif video.aspect_ratio == 4/3:
-            print("Fullscreen\nWhy are you using 4:3 in the 2020s")
-        
-
-        finalCompo = CompositeVideoClip(
-            [
-                video,
-                mph,
-                rpm,
-                throttleBar,
-                gear
-            ]
-        )
-        
         finalCompo.preview()
 
         #finalCompo.write_videofile("result.mp4")
 
         returnArray[0] = "Success!"
-        returnArray[1] = "The video has finished rendering."
+        returnArray[1] = "Preview closed."
 
     else:
         returnArray[0] = "ERROR"
         returnArray[1] = "No file selected."
 
     return returnArray
-    
+
 
 if __name__ == "__main__":
-    backendMain("100HZLOG.CSV", "IMG_0144.mp4")
+    # The sample files live in data/ next to this script, so build their paths from here to work from any directory
+    dataDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    backendMain(os.path.join(dataDir, "100HZLOG.CSV"), os.path.join(dataDir, "IMG_0144.mp4"))

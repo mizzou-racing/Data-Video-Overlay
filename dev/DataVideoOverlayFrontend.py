@@ -2,9 +2,10 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtGui import *
 from PyQt5.QtCore import *
 from pyqtLE import *
-from DataVideoOverlayBackend import backendMain
+from DataVideoOverlayBackend import backendMain, requiredColumns
 from LE import *
-import sys, csvParser
+import sys, os, csvParser
+import pandas as pd
 
 class MainWindow(QWidget):
     # This class' main purpose is to draw the main window and its associated functionality
@@ -34,15 +35,13 @@ class MainWindow(QWidget):
         self.tabs.addTab(self.tab3, "Optional")
         
 
-        self.tab1.layout = QGridLayout(self)
-
         progressBar = QProgressBar()
 
         progressBar.setRange(0,100)
 
         progressBar.setValue(0)
 
-        saveButton = PushButtonLE('Save', clicked=lambda: backendMain())
+        saveButton = PushButtonLE('Save', clicked=lambda: self.saveButtonClicked())
 
         self.tab1.setLayout(self.makeTabOne())
 
@@ -57,11 +56,11 @@ class MainWindow(QWidget):
     def makeTabOne(self):
         tabOneLayout = QGridLayout()
 
-        pathOne = TextEditLE()
-        pathOne.setPlaceholderText("Path to video")
+        self.videoPath = TextEditLE()
+        self.videoPath.setPlaceholderText("Path to video")
 
         pathOneSelect = PushButtonLE('...')
-        #pathOneSelect.clicked.connect(lambda _, pathOne=pathOne: self.loadFileButton(pathOne,0))
+        pathOneSelect.clicked.connect(lambda _: self.loadFileButton(self.videoPath,1))
 
         # The below blocked out function dynamically creates radio buttons 
         # -------------------------------------------------------
@@ -97,7 +96,7 @@ class MainWindow(QWidget):
 
         # -------------------------------------------------------
 
-        tabOneLayout.addWidget(pathOne,0,0)
+        tabOneLayout.addWidget(self.videoPath,0,0)
 
         tabOneLayout.addWidget(pathOneSelect,0,1)
 
@@ -111,18 +110,18 @@ class MainWindow(QWidget):
 
         def loadCSVLayout(tabTwoLayout):
 
-            pathOne = TextEditLE()
-            pathOne.setPlaceholderText("Path to CSV")
+            self.csvPath = TextEditLE()
+            self.csvPath.setPlaceholderText("Path to CSV")
 
             pathOneSelect = PushButtonLE('...')
-            pathOneSelect.clicked.connect(lambda _, pathOne=pathOne: self.loadFileButton(pathOne,0))
+            pathOneSelect.clicked.connect(lambda _: self.loadFileButton(self.csvPath,0))
 
 
             parseButton = PushButtonLE('Parse')
-            parseButton.clicked.connect(lambda _, tabTwoLayout=tabTwoLayout, fileLocation=pathOne.toPlainText(): displayCSVOptions(tabTwoLayout, fileLocation))
+            parseButton.clicked.connect(lambda _, tabTwoLayout=tabTwoLayout: displayCSVOptions(tabTwoLayout, self.csvPath.toPlainText()))
 
 
-            tabTwoLayout.addWidget(pathOne,0,0)
+            tabTwoLayout.addWidget(self.csvPath,0,0)
 
             tabTwoLayout.addWidget(pathOneSelect,0,1)
 
@@ -130,23 +129,41 @@ class MainWindow(QWidget):
 
 
         def displayCSVOptions(tabTwoLayout, fileLocation):
+            # parse() returns a list of dicts mapping channel name -> list of values
+            # TODO: parse() currently returns hardcoded test data; update this once it reads the real CSV
             returnedData = csvParser.parse(fileLocation)
 
+            channels = []
             for i in returnedData:
-                tabTwoLayout.addWidget()
+                for channel in i:
+                    if channel not in channels:
+                        channels.append(channel)
+
+            # Rows 0 and 1 are the path box and parse button
+            for row, channel in enumerate(channels, start=2):
+                tabTwoLayout.addWidget(QCheckBox(channel),row,0,1,2)
 
 
         if fileLoaded:
             displayCSVOptions(tabTwoLayout)
         else:
             loadCSVLayout(tabTwoLayout)
-            fileLoaded == True
+            fileLoaded = True
 
 
 
         #tabTwoLayout.addWidget(radioWidget1,1,0)
 
         return tabTwoLayout
+
+    def saveButtonClicked(self):
+        # Runs the backend with the selected files and shows the [title, message] it returns
+        result = backendMain(self.csvPath.toPlainText(), self.videoPath.toPlainText())
+
+        msg = QMessageBox()
+        msg.setWindowTitle(result[0])
+        msg.setText(result[1])
+        msg.exec()
 
     def loadFileButton(self, textBox, fileTypeIndex):
         # loads the file and ensures the data is somewhat valid
@@ -161,18 +178,39 @@ class MainWindow(QWidget):
         directory = QFileDialog.getOpenFileName(self, "Open File", "", fileTypes[fileTypeIndex], options=options)
 
         if directory[0] != '':
-      
-            try:
+
+            error = self.validateFile(directory[0], fileTypeIndex)
+
+            if error == None:
                 msg.setText("Successfully loaded file!")
                 msg.setWindowTitle("Success")
                 msg.exec()
 
                 textBox.setPlainText(directory[0])
 
-            except:
-                msg.setText("Could not load Json file.")
+            else:
+                msg.setText(error)
                 msg.setWindowTitle("Error")
                 msg.exec()
+
+    def validateFile(self, path, fileTypeIndex):
+        # Returns None if the file looks usable, otherwise a message saying what's wrong
+        if not os.path.isfile(path):
+            return f"Could not find the file:\n{path}"
+
+        if fileTypeIndex == 0:
+            # CSV: only read the header row to check the columns are there
+            try:
+                columns = pd.read_csv(path, nrows=0).columns
+            except Exception as e:
+                return f"Could not read the CSV file:\n{e}"
+
+            missingColumns = [column for column in requiredColumns if column not in columns]
+
+            if missingColumns:
+                return "The CSV is missing these columns:\n" + "\n".join(missingColumns)
+
+        return None
 
 
 
